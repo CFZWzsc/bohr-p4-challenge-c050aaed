@@ -1,0 +1,10 @@
+{
+  "case_id": "demo-annotation-notes-01",
+  "output_contract": {
+    "annotations": "array",
+    "notes": "array",
+    "links": "array",
+    "search_index": "array"
+  },
+  "annotation_files": ["annotations.json"]
+}
