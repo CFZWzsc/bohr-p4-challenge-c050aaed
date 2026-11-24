@@ -11,6 +11,20 @@ description: Use when a research-library case supplies PDFs, annotation exports,
 
 不适用：直接解析 PDF 内嵌注释对象与扫描件手写笔迹（脚本不读取 PDF 注释字典，也不做 OCR）；不做文献内容判断与写作。
 
+## Quickstart
+
+包内自带一个合成演示案例，可直接跑通：
+
+```powershell
+python scripts/run_skill.py --case examples/demo-case/case.json --out "$env:TEMP\demo_c050aaed\result.json" --work "$env:TEMP\demo_c050aaed\work"
+```
+
+- 演示输入：`examples/demo-case/case.json` + `examples/demo-case/annotations.json`（4 条合成批注，其中两条共享 perovskite/solar cell/encapsulation 词项）。
+- 输出：`$env:TEMP\demo_c050aaed\result.json`，4 条 annotations、4 条 notes、2 条 notes 关联（Jaccard 0.75）、18 条检索词，`unresolved` 为空。
+- `output_contract` 的 `annotations`、`notes`、`links`、`search_index` 四个键均非空；同一输入连续两次运行的 result.json 字节一致。
+
+> 批注为合成内容，不代表任何真实文献或官方评测数据。
+
 ## 输入
 
 - `case.json`：`case_id`、`output_contract`；可选 `material_files`、`annotation_files` 指向批注导出。
