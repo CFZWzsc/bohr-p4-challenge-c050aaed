@@ -1,0 +1,30 @@
+{
+  "annotations": [
+    {
+      "text": "Perovskite solar cell efficiency improved after encapsulation.",
+      "note": "Efficiency improved after encapsulation.",
+      "page": 3,
+      "color": "yellow",
+      "type": "highlight"
+    },
+    {
+      "text": "Perovskite solar cell stability improved after encapsulation.",
+      "note": "Stability improved after encapsulation.",
+      "page": 4,
+      "color": "green",
+      "type": "highlight"
+    },
+    {
+      "text": "Two-step spin coating produced uniform perovskite films.",
+      "note": "Reusable method note for film preparation.",
+      "page": 2,
+      "color": "blue",
+      "type": "under_line"
+    },
+    {
+      "text": "Open-circuit voltage was measured for every encapsulated device.",
+      "page": 6,
+      "type": "margin_note"
+    }
+  ]
+}
