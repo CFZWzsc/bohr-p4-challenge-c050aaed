@@ -1,0 +1,55 @@
+%PDF-1.4
+1 0 obj
+<< /Type /Catalog /Pages 2 0 R >>
+endobj
+2 0 obj
+<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>
+endobj
+3 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 5 0 R >> >> /Contents 6 0 R /Annots [8 0 R 9 0 R] >>
+endobj
+4 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 5 0 R >> >> /Contents 7 0 R /Annots [10 0 R] >>
+endobj
+5 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>
+endobj
+6 0 obj
+<< /Length 86 >>
+stream
+BT /F1 14 Tf 72 720 Td (Perovskite film stability improved after encapsulation.) Tj ET
+endstream
+endobj
+7 0 obj
+<< /Length 87 >>
+stream
+BT /F1 14 Tf 72 720 Td (Two-step spin coating produced uniform perovskite films.) Tj ET
+endstream
+endobj
+8 0 obj
+<< /Type /Annot /Subtype /Highlight /Rect [70 712 540 732] /C [1 1 0] /Contents (Stability improved after encapsulation.) /T (reviewer-a) /P 3 0 R >>
+endobj
+9 0 obj
+<< /Type /Annot /Subtype /Text /Rect [560 700 580 720] /C [0 0 1] /Contents (Check the annealing temperature for uniform films.) /T (reviewer-a) /P 3 0 R >>
+endobj
+10 0 obj
+<< /Type /Annot /Subtype /Highlight /Rect [70 712 540 732] /C [0 1 0] /Contents (Reusable method note for film preparation.) /T (reviewer-b) /P 4 0 R >>
+endobj
+xref
+0 11
+0000000000 65535 f 
+0000000009 00000 n 
+0000000058 00000 n 
+0000000121 00000 n 
+0000000269 00000 n 
+0000000412 00000 n 
+0000000482 00000 n 
+0000000618 00000 n 
+0000000755 00000 n 
+0000000920 00000 n 
+0000001092 00000 n 
+trailer
+<< /Size 11 /Root 1 0 R >>
+startxref
+1261
+%%EOF
