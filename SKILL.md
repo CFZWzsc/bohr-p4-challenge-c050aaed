@@ -7,9 +7,9 @@ description: Use when a research-library case supplies PDFs, annotation exports,
 
 ## 用途与适用条件
 
-在阅读批注整理任务中使用：从批注导出文件、Markdown 摘录、文本材料中抽取高亮/划线/页边批注，结构化为带来源定位的笔记，建立可解释关联并提供检索入口。输入为 `/input/case.json`、可选 `/input/task.md` 与材料目录。
+在阅读批注整理任务中使用：从批注导出文件、Markdown 摘录、PDF 批注字典中抽取高亮/划线/页边批注，结构化为带来源定位的笔记，建立可解释关联并提供检索入口。输入为 `/input/case.json`、可选 `/input/task.md` 与材料目录。
 
-不适用：直接解析 PDF 内嵌注释对象与扫描件手写笔迹（脚本不读取 PDF 注释字典，也不做 OCR）；不做文献内容判断与写作。
+不适用：扫描件手写笔迹 OCR 与无文本层的图像内容识别；不做文献内容判断与写作。
 
 ## Quickstart
 
@@ -19,27 +19,28 @@ description: Use when a research-library case supplies PDFs, annotation exports,
 python scripts/run_skill.py --case examples/demo-case/case.json --out "$env:TEMP\demo_c050aaed\result.json" --work "$env:TEMP\demo_c050aaed\work"
 ```
 
-- 演示输入：`examples/demo-case/case.json` + `examples/demo-case/annotations.json`（4 条合成批注，其中两条共享 perovskite/solar cell/encapsulation 词项）。
-- 输出：`$env:TEMP\demo_c050aaed\result.json`，4 条 annotations、4 条 notes、2 条 notes 关联（Jaccard 0.75）、18 条检索词，`unresolved` 为空。
+- 演示输入：`examples/demo-case/case.json` + `annotations.json`（4 条合成 JSON 批注）+ `materials/mini-annotated.pdf`（2 页、3 条带 `/Rect` 与 `/Contents` 的批注）。
+- 输出：`$env:TEMP\demo_c050aaed\result.json`，7 条 annotations（4 JSON + 3 PDF，PDF 均带 `page:N;rect:...` locator）、7 条 notes、8 条 links；1 条无文本层便签进入 `unresolved`（`annotation_without_text_layer`）。
 - `output_contract` 的 `annotations`、`notes`、`links`、`search_index` 四个键均非空；同一输入连续两次运行的 result.json 字节一致。
 
 > 批注为合成内容，不代表任何真实文献或官方评测数据。
 
 ## 输入
 
-- `case.json`：`case_id`、`output_contract`；可选 `material_files`、`annotation_files` 指向批注导出。
+- `case.json`：`case_id`、`output_contract`；可选 `material_files`、`materials`、`annotation_files` 指向批注导出与材料。
 - 支持的结构化批注：JSON 数组或含 `annotations`/`highlights` 键的对象，条目含 `text`/`quote`/`content`、`page`、`color`、`type`、`note`。
 - 支持的文本标记：Markdown 引用 `> ...`、`==高亮==`、行内 `【批注：...】`。
+- 支持的 PDF：`/Subtype /Highlight|Underline|StrikeOut|Squiggly|Text|FreeText|Square` 注释字典，扫描原始字节并 zlib 解压所有 `/FlateDecode` 流（含 `/ObjStm`）后解析 `/Rect`、`/C`、`/Contents`、`/T`，按页面 `/Annots` 归属页码；引文由页面文本层 `Tj`/`TJ` 与 `Td`/`Tm` 坐标匹配 `/Rect`。
 - 输出：`/app/output/result.json`。
 
 ## 处理流程（对应评分维度）
 
-1. **盘点与载体识别（任务完成度）**：枚举文件，识别可解析批注的 JSON/Markdown/文本；PDF 仅记录为 `pdf_annotation_layer_not_parsed`，不伪造其批注。
-2. **批注抽取（结果正确性）**：统一字段 `quote`、`note`、`page`、`color`、`type`、`source_file`、`locator`；类型按原字段保留，缺失记 `unknown`；页码缺失为 `null`，不用顺序号冒充。
+1. **盘点与载体识别（任务完成度）**：枚举文件，识别可解析批注的 JSON/Markdown 与 PDF 注释字典；PDF 无注释对象时写入 `unresolved`，不伪造批注。
+2. **批注抽取（结果正确性）**：统一字段 `quote`、`note`、`page`、`color`、`type`、`source_file`、`locator`；类型按原字段保留，缺失记 `unknown`；页码缺失为 `null`，不用顺序号冒充；PDF locator 为 `page:N;rect:x0,y0,x1,y1`。
 3. **笔记结构化（完整性）**：依据原文线索词把批注归入 `question`、`method`、`conclusion`、`reusable`、`to_verify`、`unclassified`，每条保留 `annotation_id` 与原文引用；不扩展原文没有的结论。
-4. **关联（质量）**：两条笔记共享至少 2 个高区分度词（ASCII 长度≥4 或 CJK 二元组）且 Jaccard ≥ 0.2 才建立关联，每条最多 3 条，附共享词作为依据，避免仅凭一个通用词连成一片。
+4. **关联（质量）**：去停用词后取每条笔记前 8 个高区分词；共享 ≥2 个或 Jaccard ≥ 0.15 即连边，每条最多 3 条，输出 `shared_terms` 与 `jaccard` 作为依据。
 5. **检索入口（可核验性）**：建立 `term -> note_ids` 倒排索引，附来源文件与页码，支持按标签与来源过滤。
-6. **失败与恢复（可靠体验）**：无批注、JSON 结构不符、文件不可读、PDF 无注释解析分别进入 `skipped`、`unresolved`、`errors`，并给出 `supported_inputs`。
+6. **失败与恢复（可靠体验）**：无批注、JSON 结构不符、文件不可读、PDF 无注释/无文本层分别进入 `skipped`、`unresolved`、`errors`，并给出 `supported_inputs`。
 
 ## 输出契约
 
@@ -50,7 +51,7 @@ python scripts/run_skill.py --case examples/demo-case/case.json --out "$env:TEMP
 | `status` | `success` / `partial` / `insufficient_input` / `failed` |
 | `result` | `annotations`、`notes`、`links`、`search_index`、`unresolved` |
 | `evidence` | 来源文件、哈希、抽取器、定位规则 |
-| `uncertainty` | 页码缺失、PDF 注释未解析、启发式分类 |
+| `uncertainty` | 页码缺失、PDF 无文本层批注、启发式分类 |
 | `errors` / `stats` | 真实错误与计数 |
 
 ## 异常处理表
@@ -62,12 +63,12 @@ python scripts/run_skill.py --case examples/demo-case/case.json --out "$env:TEMP
 | 材料无批注结构 | `status=partial`，列出 `supported_inputs` | `partial` |
 | JSON 解析失败 | `skipped` 记录文件与原因 | `partial` |
 | 缺页码/颜色/类型 | 字段 `null` 或 `unknown` | `partial` |
-| PDF 含注释但未解析 | 明确写入 `unresolved` | `partial` |
+| PDF 批注无文本层 | `quote=null`，写入 `unresolved=annotation_without_text_layer` | `success` |
 | 关联不足 | 不强行连边，`links` 可为空 | `success` |
 
 ## 限制
 
-- 不解析 PDF `/Annots` 注释对象与手写笔迹，不执行 OCR。
+- PDF 仅解析注释字典与简单文本层；扫描件、手写笔迹、图表内容与复杂字体不做 OCR。
 - 笔记分类为线索词启发式，可能与作者原意不同，需人工确认。
 - 不修改源文件，不覆盖原始批注导出。
 
@@ -84,7 +85,7 @@ python /skills/weekly-skill/scripts/run_skill.py --case /input/case.json --out /
 
 调用顺序（固定）：
 
-1. 先运行包内脚本（若存在）：`python scripts/run_skill.py`（默认读 `/input/case.json`，写 `/app/output/result.json`）；路径不同时用 `--case` / `--output` 指定。
+1. 先运行包内脚本（若存在）：`python scripts/run_skill.py`（默认读 `/input/case.json`，写 `/app/output/result.json`）；路径不同时用 `--case`/`--input`/`--in` 与 `--out`/`--output` 指定。
 2. 再完成脚本无法自动完成的实质工作（译文、论述、图表、修订、结论等），把结果写回 `result.json` 对应字段。
 3. 最后自检：`case_id` 与输入一致；`output_contract` 每个字段都存在；`status` 按契约取 `success`/`partial`/`insufficient_input`/`failed`（缺输入或证据不足时用 `insufficient_input`/`partial`）；无 `pending` 占位；数字、引用、来源可逐条回溯。
 
@@ -107,5 +108,5 @@ python /skills/weekly-skill/scripts/run_skill.py --case /input/case.json --out /
 1. **调用 Agent 必须交付成品，不是流程说明**：脚本产出只是索引、核对或规格骨架；调用 Agent 必须在同一 `result.json` 中补齐本题要求的最终产物（正文/译文/审稿意见/综述/分析结论/图表源文件与导出件/幻灯片页内容与讲稿/实验方案等）。交付字段为空、只有标题骨架，或含 `pending`、`TODO` 之类占位，一律视为未完成。
 2. **必须覆盖全部输入条目**：输入中的每个章节、问题、文献、图、页面、指标都要有对应条目，不得只处理示例或首条；确实缺失的条目写入 `uncertainty` / `limitations` 并说明原因，不得静默跳过。
 3. **必须自检后再交付**：`case_id` 与输入一致；`output_contract` 每个字段都存在；状态值取本题契约规定的枚举；数字、单位、引用、来源可逐条回溯；结果内部无自相矛盾。
-4. **参数等价**：`python scripts/run_skill.py --case <输入> --out <输出>` 与 `--output <输出>` 等价；默认 `/input/case.json` → `/app/output/result.json`。
+4. **参数等价**：`--case`、`--input`、`--in` 等价（目录时自动取其中的 `case.json`）；`--out` 与 `--output` 等价；默认 `/input/case.json` → `/app/output/result.json`。
 5. **平台用 3 个固定案例分别运行**：逻辑要由输入驱动，不针对某一份示例硬编码；字段命名差异走别名匹配与显式降级，并在 `uncertainty` 记录假设。
