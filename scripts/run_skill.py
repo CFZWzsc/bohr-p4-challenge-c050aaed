@@ -8,11 +8,13 @@ import json
 import os
 import re
 import sys
+import zlib
 from pathlib import Path
 
 MAX_FILES = 2000
 MAX_BYTES = 4 * 1024 * 1024
-PATH_KEYS = ("input_dir", "input_root", "materials_dir", "materials", "data_dir", "corpus_dir", "directory", "path", "root")
+PATH_KEYS = ("input_dir", "input_root", "materials_dir", "materials", "data_dir",
+             "corpus_dir", "directory", "path", "root")
 SKIP_DIRS = {"__pycache__", ".git", "node_modules", ".venv", "venv", ".cache"}
 JSON_KEYS = ("annotations", "highlights", "notes", "items", "data", "comments")
 CUE = [
@@ -38,6 +40,21 @@ ALIASES = {
     "errors": ["errors", "error"],
     "stats": ["stats", "statistics", "counts"],
 }
+EN_STOP = set(
+    "a an the and or but if then than that this these those of in on at to for "
+    "from by with as is are was were be been being it its we you they he she "
+    "i not no do does did done what which who whom when where why how about "
+    "into over under between during before after also such can could may might "
+    "should would will shall use used using every each all both more most "
+    "note notes method methods data item items page pages section sections "
+    "one two three first second third new old same other another".split()
+)
+PDF_ANNOT_SUBTYPES = {
+    "Highlight": "highlight", "Underline": "underline", "StrikeOut": "strikeout",
+    "Squiggly": "squiggly", "Text": "text", "FreeText": "freetext", "Square": "square",
+}
+PDF_HEX_TOKEN = re.compile(rb"<[0-9A-Fa-f\s]+>")
+PDF_LITERAL_TOKEN = re.compile(rb"\((?:\\.|[^()\\])*\)", re.S)
 
 
 def norm_key(name):
@@ -57,7 +74,7 @@ def contract_fields(case):
         elif isinstance(oc.get("required"), list):
             out = [x for x in oc["required"] if isinstance(x, str)]
         else:
-            out = list(oc.keys())
+            out = [str(k) for k in oc.keys()]
     elif isinstance(oc, list):
         out = [x for x in oc if isinstance(x, str)]
     seen, uniq = set(), []
@@ -106,12 +123,13 @@ def candidate_roots(case, case_path):
     return uniq
 
 
-def collect(roots, errors, skipped, exclude):
+def collect(roots, errors, skipped, exclude, base=None):
     files, seen = [], set()
     try:
         exclude_key = str(exclude.resolve()) if exclude else None
+        base_key = base.resolve() if base else None
     except OSError:
-        exclude_key = None
+        exclude_key, base_key = None, None
     for root in roots:
         if not root.exists():
             errors.append("material root not found: %s" % (root.name or str(root)))
@@ -143,13 +161,22 @@ def collect(roots, errors, skipped, exclude):
                 continue
             seen.add(rp)
             try:
-                rel = path.relative_to(root_dir).as_posix()
-            except ValueError:
-                rel = path.name
+                if base_key is None:
+                    raise ValueError("no base")
+                rel = path.resolve().relative_to(base_key).as_posix()
+            except (OSError, ValueError):
+                try:
+                    rel = path.relative_to(root_dir).as_posix()
+                except ValueError:
+                    rel = path.name
             files.append((path, rel))
     files.sort(key=lambda x: x[1])
     return files
 
+
+# --------------------------------------------------------------------------
+# JSON / Markdown annotation readers
+# --------------------------------------------------------------------------
 
 def norm_annotation(raw, source_file, index):
     def pick(*keys):
@@ -157,15 +184,24 @@ def norm_annotation(raw, source_file, index):
             if k in raw and raw[k] not in (None, ""):
                 return raw[k]
         return None
+
+    page = pick("page", "page_number", "pageno")
+    locator = pick("locator", "position", "offset")
+    rect = pick("rect", "rectangle", "bbox")
+    if not locator and isinstance(rect, (list, tuple)) and len(rect) == 4:
+        locator = "page:%s;rect:%s" % (page if page is not None else "unknown",
+                                       ",".join(str(x) for x in rect))
+    if not locator and page is not None:
+        locator = "page:%s" % page
     return {
         "id": "A%04d" % index,
         "source_file": source_file,
         "quote": pick("text", "quote", "content", "highlight", "excerpt"),
         "note": pick("note", "comment", "annotation", "memo"),
-        "page": pick("page", "page_number", "pageno"),
+        "page": page,
         "color": pick("color", "colour"),
         "type": pick("type", "category", "kind") or "unknown",
-        "locator": pick("locator", "position", "rect", "offset"),
+        "locator": locator,
     }
 
 
@@ -227,6 +263,339 @@ def from_markdown(text, source_file, out):
     return count
 
 
+# --------------------------------------------------------------------------
+# PDF annotation extraction (stdlib: FlateDecode + Tj/TJ text layer)
+# --------------------------------------------------------------------------
+
+def pdf_unescape(token):
+    out = []
+    i = 0
+    while i < len(token):
+        ch = token[i]
+        if ch == 0x5C and i + 1 < len(token):
+            nxt = token[i + 1]
+            mapping = {0x6E: 10, 0x72: 13, 0x74: 9, 0x62: 8, 0x66: 12,
+                       0x28: 40, 0x29: 41, 0x5C: 92}
+            if nxt in mapping:
+                out.append(mapping[nxt])
+                i += 2
+                continue
+            if 0x30 <= nxt <= 0x37:
+                octal = token[i + 1:i + 4]
+                try:
+                    out.append(int(octal, 8))
+                except ValueError:
+                    pass
+                i += 1 + len(octal)
+                continue
+        out.append(ch)
+        i += 1
+    return bytes(bytearray(out))
+
+
+def pdf_hex_text(raw):
+    try:
+        data = bytes(bytearray.fromhex(raw))
+    except ValueError:
+        return ""
+    if len(data) >= 2 and data[:2] in (b"\xfe\xff", b"\xff\xfe"):
+        try:
+            return data.decode("utf-16")
+        except UnicodeDecodeError:
+            return ""
+    if len(data) % 2 == 0 and data.count(0) > len(data) // 4:
+        try:
+            return data.decode("utf-16-be")
+        except UnicodeDecodeError:
+            pass
+    return data.decode("latin-1", errors="replace")
+
+
+def pdf_token_text(token):
+    if token.startswith(b"("):
+        return pdf_unescape(token[1:-1]).decode("latin-1", errors="replace")
+    raw = re.sub(rb"\s+", b"", token[1:-1]).decode("ascii", "ignore")
+    return pdf_hex_text(raw)
+
+
+def pdf_value_string(blob, key):
+    pattern = re.compile(rb"/" + key + rb"\s*(\((?:\\.|[^()\\])*\)|<[0-9A-Fa-f\s]*>)", re.S)
+    match = pattern.search(blob)
+    if not match:
+        return None
+    text = pdf_token_text(match.group(1)).strip()
+    return text or None
+
+
+def pdf_objects(data):
+    """Return [(object_number, body_bytes)] in file order."""
+    objects = []
+    for match in re.finditer(rb"(?m)^[ \t]*(\d+)\s+(\d+)\s+obj\b", data):
+        num = int(match.group(1))
+        start = match.end()
+        end = data.find(b"endobj", start)
+        if end < 0:
+            end = len(data)
+        stream = re.search(rb"stream\r?\n", data[start:end])
+        if stream:
+            stream_start = start + stream.end()
+            stream_end = data.find(b"endstream", stream_start)
+            if stream_end >= 0:
+                after = data.find(b"endobj", stream_end + len(b"endstream"))
+                if after >= 0:
+                    end = after
+        objects.append((num, data[start:end]))
+    return objects
+
+
+def pdf_streams(objects):
+    streams = {}
+    for num, body in objects:
+        match = re.search(rb"stream\r?\n", body)
+        if not match:
+            continue
+        header = body[:match.start()]
+        raw = body[match.end():]
+        end = raw.rfind(b"endstream")
+        if end >= 0:
+            raw = raw[:end]
+        raw = raw.rstrip(b"\r\n")
+        if b"/FlateDecode" in header:
+            try:
+                raw = zlib.decompress(raw)
+            except zlib.error:
+                try:
+                    raw = zlib.decompressobj().decompress(raw)
+                except zlib.error:
+                    continue
+        streams[num] = raw
+    return streams
+
+
+def pdf_objstm_objects(objects, streams):
+    """Expand objects compressed inside /Type /ObjStm streams."""
+    extra = []
+    for num, body in objects:
+        if b"/ObjStm" not in body or num not in streams:
+            continue
+        n_match = re.search(rb"/N\s+(\d+)", body)
+        first_match = re.search(rb"/First\s+(\d+)", body)
+        if not n_match or not first_match:
+            continue
+        count = int(n_match.group(1))
+        first = int(first_match.group(1))
+        decoded = streams[num]
+        header = decoded[:first]
+        numbers = [int(x) for x in re.findall(rb"\d+", header)][:2 * count]
+        pairs = [(numbers[i], numbers[i + 1]) for i in range(0, len(numbers) - 1, 2)]
+        for index, (objnum, offset) in enumerate(pairs):
+            begin = first + offset
+            end = first + pairs[index + 1][1] if index + 1 < len(pairs) else len(decoded)
+            extra.append((objnum, decoded[begin:end]))
+    return extra
+
+
+def pdf_pages(objects):
+    pages = []
+    for num, body in objects:
+        if not re.search(rb"/Type\s*/Page\b", body):
+            continue
+        if re.search(rb"/Type\s*/Pages\b", body):
+            continue
+        contents, annots = [], []
+        cm = re.search(rb"/Contents\s*(\[[^\]]*\]|\d+\s+\d+\s+R)", body)
+        if cm:
+            contents = [int(x) for x in re.findall(rb"(\d+)\s+\d+\s+R", cm.group(1))]
+        am = re.search(rb"/Annots\s*(\[[^\]]*\]|\d+\s+\d+\s+R)", body)
+        if am:
+            annots = [int(x) for x in re.findall(rb"(\d+)\s+\d+\s+R", am.group(1))]
+        pages.append({"obj": num, "body": body, "contents": contents, "annots": annots})
+    return pages
+
+
+def pdf_parse_rect(body):
+    match = re.search(rb"/Rect\s*\[\s*([^\]]+)\]", body)
+    if not match:
+        return None
+    numbers = [float(x) for x in re.findall(rb"[-+]?\d*\.?\d+", match.group(1))]
+    if len(numbers) != 4:
+        return None
+    x0, y0, x1, y1 = numbers
+    return (min(x0, x1), min(y0, y1), max(x0, x1), max(y0, y1))
+
+
+def pdf_parse_color(body):
+    match = re.search(rb"/C\s*\[([^\]]*)\]", body)
+    if not match:
+        named = re.search(rb"/C\s*/(\w+)", body)
+        if named:
+            table = {b"Y": "yellow", b"G": "green", b"B": "blue",
+                     b"R": "red", b"K": "black"}
+            return table.get(named.group(1), None)
+        return None
+    values = [float(x) for x in re.findall(rb"[-+]?\d*\.?\d+", match.group(1))]
+    if len(values) == 1:
+        grey = values[0]
+        return "black" if grey < 0.05 else ("white" if grey > 0.95 else "grey")
+    if len(values) == 3:
+        rgb = tuple(values)
+        palette = [
+            ((1, 1, 0), "yellow"), ((0, 1, 0), "green"), ((0, 0, 1), "blue"),
+            ((1, 0, 0), "red"), ((1, 0.5, 0), "orange"), ((1, 0, 1), "magenta"),
+            ((0, 1, 1), "cyan"), ((0, 0, 0), "black"), ((1, 1, 1), "white"),
+        ]
+        best, best_distance = None, 1.0
+        for reference, name in palette:
+            distance = sum((a - b) ** 2 for a, b in zip(rgb, reference)) ** 0.5
+            if distance < best_distance:
+                best, best_distance = name, distance
+        if best is not None and best_distance <= 0.3:
+            return best
+        return "rgb(%s)" % ",".join(fmt_number(v) for v in rgb)
+    if len(values) == 4:
+        return "cmyk(%s)" % ",".join(fmt_number(v) for v in values)
+    return None
+
+
+def fmt_number(value):
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return "0"
+    if abs(value - round(value)) < 1e-6:
+        return str(int(round(value)))
+    return ("%.3f" % value).rstrip("0").rstrip(".")
+
+
+PDF_RUN_RE = re.compile(
+    r"([-+]?\d*\.?\d+)\s+([-+]?\d*\.?\d+)\s+([-+]?\d*\.?\d+)\s+"
+    r"([-+]?\d*\.?\d+)\s+([-+]?\d*\.?\d+)\s+([-+]?\d*\.?\d+)\s+Tm"
+    r"|([-+]?\d*\.?\d+)\s+([-+]?\d*\.?\d+)\s+(?:Td|TD)"
+    r"|(T\*)"
+    r"|\[((?:\\.|[^\]])*)\]\s*TJ"
+    r"|(\((?:\\.|[^()\\])*\))\s*Tj", re.S)
+
+
+def pdf_tj_strings(array_text):
+    parts = []
+    for match in re.finditer(r"\((?:\\.|[^()\\])*\)|<[0-9A-Fa-f\s]+>", array_text, re.S):
+        token = match.group(0).encode("latin-1", "replace")
+        text = pdf_token_text(token)
+        if text:
+            parts.append(text)
+    return "".join(parts)
+
+
+def page_text_runs(content):
+    """Approximate text runs: (x, y, text) from Tm/Td/T*/Tj/TJ."""
+    text = content.decode("latin-1", errors="replace")
+    runs = []
+    x = y = 0.0
+    for match in PDF_RUN_RE.finditer(text):
+        if match.group(1) is not None:
+            x, y = float(match.group(5)), float(match.group(6))
+        elif match.group(7) is not None:
+            x += float(match.group(7))
+            y += float(match.group(8))
+        elif match.group(9) is not None:
+            y -= 12.0
+        elif match.group(10) is not None:
+            piece = pdf_tj_strings(match.group(10))
+            if piece.strip():
+                runs.append((x, y, piece))
+        elif match.group(11) is not None:
+            piece = pdf_token_text(match.group(11).encode("latin-1", "replace"))
+            if piece.strip():
+                runs.append((x, y, piece))
+    return runs
+
+
+def pdf_quote_for_rect(runs, rect):
+    x0, y0, x1, y1 = rect
+    picked = []
+    for rx, ry, text in runs:
+        if not (y0 - 2 <= ry <= y1 + 2) or not text.strip():
+            continue
+        # approximate horizontal extent: no width metrics in a pure-stdlib reader
+        extent = max(6.0 * len(text), 1.0)
+        if rx <= x1 + 2 and rx + extent >= x0 - 2:
+            picked.append((ry, rx, text.strip()))
+    picked.sort(key=lambda item: (-item[0], item[1]))
+    quote = " ".join(item[2] for item in picked).strip()
+    return quote or None
+
+
+def pdf_annotations(data, rel):
+    """Extract annotation dictionaries, page attribution, locators and page text."""
+    objects = pdf_objects(data)
+    streams = pdf_streams(objects)
+    objects = objects + pdf_objstm_objects(objects, streams)
+    pages = pdf_pages(objects)
+    annotation_page = {}
+    for page_number, page in enumerate(pages, 1):
+        for ref in page["annots"]:
+            annotation_page.setdefault(ref, page_number)
+    annotations, unresolved = [], []
+    seen = set()
+    run_cache = {}
+    for num, body in objects:
+        subtype = re.search(
+            rb"/Subtype\s*/(Highlight|Underline|StrikeOut|Squiggly|Text|FreeText|Square)\b",
+            body)
+        if not subtype:
+            continue
+        rect = pdf_parse_rect(body)
+        if rect is None:
+            continue
+        kind = PDF_ANNOT_SUBTYPES.get(subtype.group(1).decode("ascii", "ignore"), "unknown")
+        page = annotation_page.get(num)
+        quote = None
+        if page is not None:
+            if page not in run_cache:
+                runs = []
+                for ref in pages[page - 1]["contents"]:
+                    if ref in streams:
+                        runs.extend(page_text_runs(streams[ref]))
+                run_cache[page] = runs
+            quote = pdf_quote_for_rect(run_cache[page], rect)
+        locator = "page:%s;rect:%s,%s,%s,%s" % (
+            page if page is not None else "unknown",
+            fmt_number(rect[0]), fmt_number(rect[1]),
+            fmt_number(rect[2]), fmt_number(rect[3]))
+        note = pdf_value_string(body, b"Contents")
+        author = pdf_value_string(body, b"T")
+        color = pdf_parse_color(body)
+        signature = (kind, rect, note, color, page)
+        if signature in seen:
+            continue
+        seen.add(signature)
+        annotations.append({
+            "source_file": rel,
+            "quote": quote,
+            "note": note,
+            "page": page,
+            "color": color,
+            "type": kind,
+            "locator": locator,
+            "author": author,
+        })
+        if quote is None:
+            unresolved.append({
+                "file": rel, "page": page, "locator": locator,
+                "reason": "annotation_without_text_layer",
+            })
+        if page is None:
+            unresolved.append({
+                "file": rel, "locator": locator,
+                "reason": "annotation_page_not_mapped",
+            })
+    return annotations, unresolved
+
+
+# --------------------------------------------------------------------------
+# notes, links and search index
+# --------------------------------------------------------------------------
+
 def classify(text):
     low = (text or "").lower()
     for label, cues in CUE:
@@ -238,11 +607,18 @@ def classify(text):
 
 def tokens(text):
     text = (text or "").lower()
-    out = set(w for w in re.findall(r"[a-z]{4,}", text))
+    out = set()
+    for word in re.findall(r"[a-z][a-z0-9\-]{3,}", text):
+        if word not in EN_STOP and not word.isdigit():
+            out.add(word)
     for run in re.findall(r"[\u4e00-\u9fff]{2,}", text):
         for i in range(len(run) - 1):
             out.add(run[i:i + 2])
     return out
+
+
+def key_terms(token_set, limit=8):
+    return sorted(token_set, key=lambda term: (-len(term), term))[:limit]
 
 
 def resolve_field(field, payload):
@@ -253,15 +629,35 @@ def resolve_field(field, payload):
     return None, None
 
 
+def resolve_case(raw):
+    path = Path(str(raw))
+    if path.is_dir():
+        return path / "case.json"
+    if path.suffix.lower() == ".json":
+        return path
+    return path / "case.json"
+
+
+def resolve_out(raw):
+    path = Path(str(raw))
+    if path.exists() and path.is_dir():
+        return path / "result.json"
+    if path.suffix.lower() == ".json":
+        return path
+    return path / "result.json"
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description="Annotation note distiller (stdlib only)")
-    parser.add_argument("--case", default="/input/case.json")
-    parser.add_argument("--out", "--output", default="/app/output/result.json")
+    parser.add_argument("--case", "--input", "--in", dest="case", default="/input",
+                        help="case.json, its directory, or a material directory")
+    parser.add_argument("--out", "--output", dest="out", default="/app/output/result.json")
     parser.add_argument("--work", default="/app/work")
     args = parser.parse_args(argv)
-    os.environ["SK_RESULT_PATH"] = str(getattr(args, "out", None) or getattr(args, "output", None) or "")
+    out_path = resolve_out(args.out)
+    os.environ["SK_RESULT_PATH"] = str(out_path)
 
-    case_path = Path(args.case)
+    case_path = resolve_case(args.case)
     errors, skipped, case, status = [], [], {}, "success"
     try:
         with open(case_path, "r", encoding="utf-8-sig") as fh:
@@ -278,7 +674,8 @@ def main(argv=None):
     manifest = []
 
     if status != "failed":
-        for path, rel in collect(candidate_roots(case, case_path), errors, skipped, case_path):
+        for path, rel in collect(candidate_roots(case, case_path), errors, skipped, case_path,
+                                 case_path.parent):
             ext = path.suffix.lower()
             try:
                 data = path.read_bytes()[:MAX_BYTES]
@@ -305,8 +702,14 @@ def main(argv=None):
                 from_markdown(text, rel, annotations)
                 entry["extractor"] = "markdown-quote-and-highlight"
             elif ext == ".pdf":
-                entry["extractor"] = "not-parsed"
-                unresolved.append({"file": rel, "reason": "pdf_annotation_layer_not_parsed"})
+                extracted, pdf_unresolved = pdf_annotations(data, rel)
+                unresolved.extend(pdf_unresolved)
+                for item in extracted:
+                    item["id"] = "A%04d" % (len(annotations) + 1)
+                    annotations.append(item)
+                entry["extractor"] = "pdf-annotation-flate-tj-tj"
+                if not extracted:
+                    unresolved.append({"file": rel, "reason": "pdf_without_annotation_objects"})
             else:
                 skipped.append({"path": rel, "reason": "unsupported extension"})
                 continue
@@ -316,7 +719,7 @@ def main(argv=None):
             status = "insufficient_input"
         elif not annotations:
             status = "partial"
-            unresolved.append({"file": "*", "reason": "no_annotation_records_found; supported inputs are JSON annotation exports and Markdown quote/highlight syntax"})
+            unresolved.append({"file": "*", "reason": "no_annotation_records_found; supported inputs are JSON annotation exports, Markdown quote/highlight syntax and PDF annotation dictionaries"})
 
     notes, links = [], []
     for ann in annotations:
@@ -331,26 +734,27 @@ def main(argv=None):
             "note": ann["note"],
             "category": category,
             "category_basis": basis,
-            "tags": sorted(tokens(text))[:6],
+            "locator": ann["locator"],
+            "tags": key_terms(tokens(text), 6),
         })
 
-    tok_map = [tokens(" ".join(x for x in (n["quote"], n["note"]) if x)) for n in notes]
+    token_map = [tokens(" ".join(x for x in (n["quote"], n["note"]) if x)) for n in notes]
+    key_map = [set(key_terms(token_set, 8)) for token_set in token_map]
     for i in range(len(notes)):
         candidates = []
-        for j in range(len(notes)):
-            if i == j:
-                continue
-            shared = tok_map[i] & tok_map[j]
-            union = tok_map[i] | tok_map[j]
-            if len(shared) >= 2 and union:
-                jac = len(shared) / float(len(union))
-                if jac >= 0.2:
-                    candidates.append((jac, len(shared), notes[j]["note_id"], sorted(shared)[:5]))
+        for j in range(i + 1, len(notes)):
+            shared = key_map[i] & key_map[j]
+            union = token_map[i] | token_map[j]
+            jaccard = len(token_map[i] & token_map[j]) / float(len(union)) if union else 0.0
+            if len(shared) >= 2 or jaccard >= 0.15:
+                candidates.append((jaccard, len(shared), notes[j]["note_id"],
+                                   sorted(shared)[:8]))
         candidates.sort(key=lambda x: (-x[0], -x[1], x[2]))
-        for jac, count, target, shared in candidates[:3]:
+        for jaccard, _count, target, shared_terms in candidates[:3]:
             links.append({"from": notes[i]["note_id"], "to": target,
-                          "shared_terms": shared, "jaccard": round(jac, 3),
-                          "basis": "shared_terms>=2 and jaccard>=0.2"})
+                          "shared_terms": shared_terms,
+                          "jaccard": round(jaccard, 3),
+                          "basis": "shared_terms>=2 or jaccard>=0.15"})
 
     index = {}
     for note in notes:
@@ -364,12 +768,16 @@ def main(argv=None):
     result = {"annotations": annotations, "notes": notes, "links": links,
               "search_index": search_index, "unresolved": unresolved, "manifest": manifest}
     evidence = {"extractors": {m["file"]: m["extractor"] for m in manifest},
-                "location_rule": "page from source field; locator from JSON or markdown line number; no invented page",
+                "location_rule": ("page from source field or PDF /Annots mapping; "
+                                  "locator from JSON fields, markdown line number or "
+                                  "page:N;rect:x0,y0,x1,y1; no invented page"),
                 "source_mutation": "none"}
     uncertainty = [
-        "PDF annotation layers and handwritten marks are not parsed; they are reported as unresolved.",
+        "PDF annotation extraction scans object dictionaries and FlateDecode streams; "
+        "annotations without a matching text-layer run keep quote=null and are listed in unresolved.",
         "Note categories use cue-word heuristics and require human confirmation.",
-        "Links require at least two shared distinctive terms; absence of links is not proof of unrelatedness.",
+        "Links require two of the top-8 distinctive terms or Jaccard >= 0.15; "
+        "absence of links is not proof of unrelatedness.",
     ]
     stats = {"files": len(manifest), "annotations": len(annotations), "notes": len(notes),
              "links": len(links), "unresolved": len(unresolved), "skipped": len(skipped),
@@ -387,18 +795,22 @@ def main(argv=None):
     output["search_index"] = search_index
     output["unresolved"] = unresolved
     notes_out = []
+    contract_extras = {"source": "output_contract", "mapped": {}, "unknown_fields": [],
+                       "accepted_extra_fields": []}
     for field in fields:
         canonical, value = resolve_field(field, payload)
         if canonical is None:
             output[field] = None
+            contract_extras["unknown_fields"].append(field)
             notes_out.append("%s: no supported producer in this skill; null retained" % field)
         else:
             output[field] = value
+            contract_extras["mapped"][field] = canonical
     if notes_out:
         output["contract_notes"] = notes_out
+    output["contract_extras"] = contract_extras
 
     try:
-        out_path = Path(args.out)
         out_path.parent.mkdir(parents=True, exist_ok=True)
         with open(out_path, "w", encoding="utf-8") as fh:
             json.dump(output, fh, ensure_ascii=False, indent=2)
@@ -412,6 +824,9 @@ def main(argv=None):
         with open(work / "notes.jsonl", "w", encoding="utf-8") as fh:
             for note in notes:
                 fh.write(json.dumps(note, ensure_ascii=False) + "\n")
+        with open(work / "annotations.jsonl", "w", encoding="utf-8") as fh:
+            for ann in annotations:
+                fh.write(json.dumps(ann, ensure_ascii=False) + "\n")
     except OSError:
         pass
     return 0
