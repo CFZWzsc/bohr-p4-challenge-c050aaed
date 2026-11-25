@@ -18,6 +18,7 @@ answers, private data or credentials are included.
 | `SKILL.md` |
 | `examples/demo-case/annotations.json` |
 | `examples/demo-case/case.json` |
+| `examples/demo-case/materials/mini-annotated.pdf` |
 | `scripts/run_skill.py` |
 | `README.md` |
 
